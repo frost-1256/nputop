@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import curses
 import json
-import os
 import re
 import signal
 import sys
@@ -19,6 +18,8 @@ from typing import Iterable, Optional
 
 DEFAULT_INTERVAL = 1.0
 PCI_RE = re.compile(r"^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$")
+INTEL_VENDOR_ID = "0x8086"
+ACCELERATOR_CLASS_PREFIX = "0x12"
 
 
 def read_text(path: Path) -> Optional[str]:
@@ -90,6 +91,22 @@ def clamp_percent(value: float) -> float:
     return value
 
 
+def driver_name_for_device(device_path: Path) -> Optional[str]:
+    driver_link = device_path / "driver"
+    if driver_link.exists() or driver_link.is_symlink():
+        return driver_link.resolve().name
+    return None
+
+
+def is_intel_accelerator(vendor: Optional[str], class_code: Optional[str]) -> bool:
+    return (
+        vendor is not None
+        and vendor.lower() == INTEL_VENDOR_ID
+        and class_code is not None
+        and class_code.lower().startswith(ACCELERATOR_CLASS_PREFIX)
+    )
+
+
 @dataclass(frozen=True)
 class NPUDevice:
     name: str
@@ -104,9 +121,9 @@ class NPUDevice:
 
     @property
     def driver(self) -> str:
-        driver_link = self.device_path / "driver"
-        if driver_link.exists() or driver_link.is_symlink():
-            return driver_link.resolve().name
+        driver = driver_name_for_device(self.device_path)
+        if driver:
+            return driver
         return "intel_vpu" if self.busy_path.exists() else "--"
 
     @property
@@ -181,6 +198,24 @@ class Sample:
     util_percent: Optional[float]
     interval_s: Optional[float]
     counter_reset: bool = False
+
+
+@dataclass(frozen=True)
+class NPUCandidate:
+    pci_id: str
+    device_path: Path
+    vendor: Optional[str]
+    device: Optional[str]
+    class_code: Optional[str]
+    driver: Optional[str]
+    reason: str
+
+
+@dataclass(frozen=True)
+class DetectionReport:
+    devices: list[NPUDevice]
+    candidates: list[NPUCandidate]
+    diagnostics: list[str]
 
 
 def sample_from_raw(current: RawSample, previous: Optional[RawSample]) -> Sample:
@@ -267,6 +302,99 @@ def discover_devices(sysfs_root: Path = Path("/sys")) -> list[NPUDevice]:
             )
 
     return devices
+
+
+def iter_pci_device_paths(sysfs_root: Path) -> Iterable[Path]:
+    seen: set[Path] = set()
+
+    pci_devices = sysfs_root / "bus" / "pci" / "devices"
+    if pci_devices.exists():
+        for entry in sorted(pci_devices.iterdir()):
+            if not PCI_RE.match(entry.name):
+                continue
+            resolved = entry.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            yield resolved
+
+    driver_root = sysfs_root / "bus" / "pci" / "drivers" / "intel_vpu"
+    if driver_root.exists():
+        for entry in sorted(driver_root.iterdir()):
+            if not PCI_RE.match(entry.name):
+                continue
+            resolved = entry.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            yield resolved
+
+
+def candidate_reason(device_path: Path, driver: Optional[str], vendor: Optional[str], class_code: Optional[str]) -> str:
+    if (device_path / "npu_busy_time_us").exists():
+        return "monitorable sysfs counters are present"
+    if driver == "intel_vpu":
+        return "intel_vpu is bound, but npu_busy_time_us is missing"
+    if is_intel_accelerator(vendor, class_code):
+        if driver:
+            return f"Intel accelerator class device is bound to {driver}, not intel_vpu"
+        return "Intel accelerator class device has no bound driver"
+    return "not an Intel accelerator class device"
+
+
+def discover_candidates(sysfs_root: Path = Path("/sys"), exclude: Iterable[Path] = ()) -> list[NPUCandidate]:
+    excluded = {path.resolve() for path in exclude}
+    candidates: list[NPUCandidate] = []
+
+    for device_path in iter_pci_device_paths(sysfs_root):
+        if device_path in excluded:
+            continue
+        vendor = read_text(device_path / "vendor")
+        device = read_text(device_path / "device")
+        class_code = read_text(device_path / "class")
+        driver = driver_name_for_device(device_path)
+        if driver != "intel_vpu" and not is_intel_accelerator(vendor, class_code):
+            continue
+        candidates.append(
+            NPUCandidate(
+                pci_id=device_path.name if PCI_RE.match(device_path.name) else "--",
+                device_path=device_path,
+                vendor=vendor,
+                device=device,
+                class_code=class_code,
+                driver=driver,
+                reason=candidate_reason(device_path, driver, vendor, class_code),
+            )
+        )
+
+    return candidates
+
+
+def detection_diagnostics(sysfs_root: Path, devices: list[NPUDevice], candidates: list[NPUCandidate]) -> list[str]:
+    if devices:
+        return [f"Detected {len(devices)} monitorable Intel AI Boost NPU device(s)."]
+
+    diagnostics = ["No monitorable Intel AI Boost NPU was found."]
+    if candidates:
+        diagnostics.append("Intel accelerator PCI candidate(s) were found, but none expose NPU busy counters.")
+    else:
+        diagnostics.append("No Intel PCI accelerator class device was found.")
+
+    if not (sysfs_root / "class" / "accel").exists():
+        diagnostics.append("/sys/class/accel is missing; the accelerator subsystem may be unavailable.")
+    if not (sysfs_root / "bus" / "pci" / "drivers" / "intel_vpu").exists():
+        diagnostics.append("intel_vpu is not visible under /sys/bus/pci/drivers.")
+    if not (sysfs_root / "module" / "intel_vpu").exists():
+        diagnostics.append("intel_vpu kernel module is not loaded.")
+
+    diagnostics.append("On NixOS, check kernel support, firmware, and the BIOS/UEFI NPU setting.")
+    return diagnostics
+
+
+def detect_system(sysfs_root: Path = Path("/sys")) -> DetectionReport:
+    devices = discover_devices(sysfs_root)
+    candidates = discover_candidates(sysfs_root, (device.device_path for device in devices))
+    return DetectionReport(devices, candidates, detection_diagnostics(sysfs_root, devices, candidates))
 
 
 def device_from_path(path_text: str, sysfs_root: Path = Path("/sys")) -> NPUDevice:
@@ -363,6 +491,29 @@ def sample_to_dict(device: NPUDevice, sample: Sample) -> dict[str, object]:
     }
 
 
+def candidate_to_dict(candidate: NPUCandidate) -> dict[str, object]:
+    return {
+        "pci_id": candidate.pci_id,
+        "device_path": str(candidate.device_path),
+        "vendor": candidate.vendor,
+        "device": candidate.device,
+        "class_code": candidate.class_code,
+        "driver": candidate.driver,
+        "reason": candidate.reason,
+    }
+
+
+def detection_report_to_dict(report: DetectionReport) -> dict[str, object]:
+    return {
+        "devices": [
+            sample_to_dict(device, Sample(device.read_raw(), None, None))
+            for device in report.devices
+        ],
+        "candidates": [candidate_to_dict(candidate) for candidate in report.candidates],
+        "diagnostics": report.diagnostics,
+    }
+
+
 def format_sample_line(device: NPUDevice, sample: Sample) -> str:
     raw = sample.raw
     util = "--.-%" if sample.util_percent is None else f"{sample.util_percent:5.1f}%"
@@ -377,6 +528,39 @@ def format_sample_line(device: NPUDevice, sample: Sample) -> str:
         f"power {raw.runtime_status or '--'} state {raw.power_state or '--'} "
         f"sched {raw.sched_mode or '--'} busy {format_seconds_from_us(raw.busy_us)}"
     )
+
+
+def format_candidate_line(index: int, candidate: NPUCandidate) -> str:
+    return (
+        f"candidate {index}: pci={candidate.pci_id} "
+        f"driver={candidate.driver or '--'} vendor={candidate.vendor or '--'} "
+        f"device={candidate.device or '--'} class={candidate.class_code or '--'} "
+        f"reason={candidate.reason}"
+    )
+
+
+def print_detection_report(report: DetectionReport, as_json: bool, stream=sys.stdout) -> None:
+    if as_json:
+        print(json.dumps(detection_report_to_dict(report), indent=2, sort_keys=True), file=stream)
+        return
+
+    if report.devices:
+        for index, device in enumerate(report.devices):
+            raw = device.read_raw()
+            devnode = str(device.devnode) if device.devnode else "--"
+            print(
+                f"{index}: {device.name} dev={devnode} pci={device.pci_id} "
+                f"driver={device.driver} path={device.device_path} "
+                f"module={raw.module_version or '--'}",
+                file=stream,
+            )
+    else:
+        for line in report.diagnostics:
+            print(line, file=stream)
+
+    if report.candidates:
+        for index, candidate in enumerate(report.candidates):
+            print(format_candidate_line(index, candidate), file=stream)
 
 
 def addstr(screen: curses.window, y: int, x: int, text: str, attr: int = 0) -> None:
@@ -537,6 +721,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--stream", action="store_true", help="Print samples continuously without curses")
     parser.add_argument("--json", action="store_true", help="Use JSON output with --once, --stream, or --list")
     parser.add_argument("--list", action="store_true", help="List detected Intel AI Boost NPU devices")
+    parser.add_argument("--diagnose", action="store_true", help="Show NPU auto-detection diagnostics")
     parser.add_argument("--no-curses", action="store_true", help="Use line output instead of the curses UI")
     parser.add_argument("--sysfs-root", default="/sys", help=argparse.SUPPRESS)
     return parser
@@ -548,22 +733,28 @@ def main(argv: Optional[list[str]] = None) -> int:
         print("warning: kernel documentation recommends a 1 second read period for npu_busy_time_us", file=sys.stderr)
 
     sysfs_root = Path(args.sysfs_root)
+    report: Optional[DetectionReport] = None
+    if args.diagnose:
+        report = detect_system(sysfs_root)
+        print_detection_report(report, args.json)
+        return 0
+
     if args.list:
-        print_devices(discover_devices(sysfs_root), args.json)
+        report = detect_system(sysfs_root)
+        if report.devices:
+            print_devices(report.devices, args.json)
+        else:
+            print_detection_report(report, args.json)
         return 0
 
     if args.device:
         device = device_from_path(args.device, sysfs_root)
     else:
-        devices = discover_devices(sysfs_root)
-        if not devices:
-            print(
-                "No Intel AI Boost NPU found. Looked under /sys/class/accel and "
-                "/sys/bus/pci/drivers/intel_vpu.",
-                file=sys.stderr,
-            )
+        report = report or detect_system(sysfs_root)
+        if not report.devices:
+            print_detection_report(report, args.json, stream=sys.stderr)
             return 1
-        device = devices[0]
+        device = report.devices[0]
 
     if args.once or (not sys.stdout.isatty() and not args.stream):
         sample = collect_sample(device, args.interval)

@@ -19,6 +19,7 @@ nix run .#npu-top
 nix run .#npu-top -- --once
 nix run .#npu-top -- --json --once
 nix run .#npu-top -- --list
+nix run .#npu-top -- --diagnose
 ```
 
 The command also installs an alias named `intel-ai-boost-top`.
@@ -28,6 +29,7 @@ From GitHub:
 ```sh
 nix run github:frost-1256/npu-top
 nix run github:frost-1256/npu-top -- --once
+nix run github:frost-1256/npu-top -- --diagnose
 ```
 
 If the directory is not a valid Git checkout, force Nix to treat it as a plain
@@ -72,3 +74,13 @@ redistributable firmware by default.
 
 The kernel documentation recommends reading `npu_busy_time_us` about once per
 second, so the default refresh interval is `1.0s`.
+
+## Auto Detection
+
+`npu-top` automatically selects the first monitorable Intel AI Boost NPU found
+under `/sys/class/accel` or `/sys/bus/pci/drivers/intel_vpu`.
+
+If no monitorable NPU exists, normal monitoring commands exit with status `1`
+and print diagnostics. `--diagnose` shows the same detection report explicitly,
+including Intel PCI accelerator candidates that are present but do not expose
+`npu_busy_time_us`.

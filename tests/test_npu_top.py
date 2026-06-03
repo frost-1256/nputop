@@ -7,7 +7,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from npu_top import discover_devices, render_bar, sample_from_raw, RawSample
+from npu_top import detect_system, discover_devices, render_bar, sample_from_raw, RawSample
 
 
 def raw(timestamp, busy_us):
@@ -61,6 +61,28 @@ class NpuTopTests(unittest.TestCase):
             self.assertEqual(len(devices), 1)
             self.assertEqual(devices[0].name, "accel0")
             self.assertEqual(devices[0].pci_id, "0000:00:0b.0")
+
+    def test_detects_intel_accelerator_candidate_without_counters(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            dev = root / "bus" / "pci" / "devices" / "0000:00:0b.0"
+            dev.mkdir(parents=True)
+            (dev / "vendor").write_text("0x8086\n", encoding="utf-8")
+            (dev / "device").write_text("0x643e\n", encoding="utf-8")
+            (dev / "class").write_text("0x120000\n", encoding="utf-8")
+
+            report = detect_system(root)
+            self.assertEqual(report.devices, [])
+            self.assertEqual(len(report.candidates), 1)
+            self.assertEqual(report.candidates[0].pci_id, "0000:00:0b.0")
+            self.assertIn("no bound driver", report.candidates[0].reason)
+
+    def test_reports_no_devices_when_sysfs_has_no_npu(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report = detect_system(Path(tmpdir))
+            self.assertEqual(report.devices, [])
+            self.assertEqual(report.candidates, [])
+            self.assertIn("No monitorable Intel AI Boost NPU was found.", report.diagnostics)
 
 
 if __name__ == "__main__":
