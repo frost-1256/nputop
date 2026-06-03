@@ -1,0 +1,5 @@
+/.git-real
+/result
+/.direnv
+__pycache__/
+*.pyc
